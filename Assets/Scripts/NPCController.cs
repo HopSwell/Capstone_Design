@@ -1,4 +1,4 @@
-using Newtonsoft.Json.Linq;
+ï»¿using Newtonsoft.Json.Linq;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text;
@@ -10,22 +10,22 @@ public class NPCController : MonoBehaviour
 {
     public enum NPCState { Idle, Greeting, Story, Farewell }
 
-    [Header("NPC ¼³Á¤")]
+    [Header("í…ŒìŠ¤íŠ¸ ì„¤ì •")]
+    [Tooltip("ì²´í¬ ì‹œ API í†µì‹ ì„ ìƒëµí•˜ê³  ê°€ì§œ í…ìŠ¤íŠ¸ë¥¼ ì¶œë ¥í•©ë‹ˆë‹¤. (í† í° ì†Œëª¨ 0)")]
+    public bool isDevMode = false;
+
+    [Header("NPC ì„¤ì •")]
     public string npcName;
     [TextArea(3, 5)]
-    public string systemPrompt;
-    public string defaultOutput = "Áö±İÀº ¹Ùºü º¸ÀÎ´Ù, ´ÙÀ½¿¡ ´Ù½Ã Ã£¾Æ¿ÀÀÚ";
+    public string defaultOutput = "ì§€ê¸ˆì€ ëŒ€í™”í•˜ê¸° ì¢€ ì–´ë µë„¤. | ì ì‹œ ë’¤ì— ì˜¤ê²Œë‚˜.";
 
-    [Header("½ºÅä¸® µ¥ÀÌÅÍ")]
-    public DialogueData dialogueData;
-
-    [Header("ÂüÁ¶ ¸ğµâ")]
+    [Header("ì°¸ì¡° ëª¨ë“ˆ")]
     public LLMSettings llmSettings;
 
-    [Header("UI ¼³Á¤")]
+    [Header("UI ì„¤ì •")]
     public GameObject localInteractionUI;
 
-    [Header("È¸Àü ¼³Á¤")]
+    [Header("íšŒì „ ì„¤ì •")]
     public float turnSpeed = 4f;
     private Transform playerTransform;
     private Coroutine lookCoroutine;
@@ -34,82 +34,184 @@ public class NPCController : MonoBehaviour
     private NPCState currentState = NPCState.Idle;
     private int currentStoryIndex = 0;
 
-    private List<string> dialoguePool = new List<string>();
-    private bool isLoaded = false;
+    // ëŒ€ì‚¬ ì €ì¥ì†Œ (ë©”ëª¨ë¦¬ ìºì‹±)
+    private List<string> defaultDialoguePool = new List<string>();
+    private Dictionary<int, List<string>> cachedStoryDialogues = new Dictionary<int, List<string>>();
+    private List<string> activeDialoguePool = null;
+
     private bool isPlayerInRange = false;
-
-    private static float globalApiDelay = 0f;
-    private static int currentKeyIndex = 0;
-
-    private void Awake()
-    {
-        globalApiDelay = 0f;
-    }
+    private int lastKnownQuestStep = -1;
+    private bool isFetching = false;
 
     private void Start()
     {
         initialRotation = transform.rotation;
+        defaultDialoguePool = ProcessDialogueText(defaultOutput);
 
-        if (llmSettings != null)
+        // ì”¬ ì‹œì‘ ì‹œ í˜„ì¬ í€˜ìŠ¤íŠ¸ ìŠ¤í…ì— ëŒ€í•´ì„œë§Œ ë¡œë”© (Plan B ì ìš©)
+        if (StoryManager.Instance != null)
         {
-            Debug.Log($"{npcName}: LLM ¼³Á¤ È®ÀÎ");
-            StartCoroutine(DelayedPreload());
-            globalApiDelay += 1.5f;
+            lastKnownQuestStep = StoryManager.Instance.currentQuestStep;
+            StartCoroutine(FetchStoryDialogueIfMissing(lastKnownQuestStep));
         }
-        else
-        {
-            Debug.LogError($"{npcName}: LLM Settings ´©¶ô");
-        }
-    }
-
-    private IEnumerator DelayedPreload()
-    {
-        float waitTime = globalApiDelay;
-        Debug.Log($"{npcName}: {waitTime}ÃÊ ÈÄ API ¿äÃ» ½ÃÀÛ");
-
-        if (waitTime > 0)
-        {
-            yield return new WaitForSeconds(waitTime);
-        }
-        yield return StartCoroutine(PreloadDialogue());
     }
 
     void Update()
     {
+        // Page Up/Down ë“±ìœ¼ë¡œ í€˜ìŠ¤íŠ¸ ìŠ¤í…ì´ ë³€ê²½ëœ ê²ƒì„ ê°ì§€í•˜ë©´ í•´ë‹¹ ìŠ¤í… ëŒ€ë³¸ ì¶”ê°€ ë¡œë”©
+        if (StoryManager.Instance != null && StoryManager.Instance.currentQuestStep != lastKnownQuestStep)
+        {
+            lastKnownQuestStep = StoryManager.Instance.currentQuestStep;
+            StartCoroutine(FetchStoryDialogueIfMissing(lastKnownQuestStep));
+        }
+
         if (isPlayerInRange && Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame)
         {
-            if (!DialogueUIManager.Instance.isDialogueActive && currentState != NPCState.Idle)
-            {
-                ResetDialogueState();
-            }
-
             Interact();
         }
+    }
+
+    private IEnumerator FetchStoryDialogueIfMissing(int step)
+    {
+        // 1. ì´ë¯¸ ìºì‹±ë˜ì–´ ìˆë‹¤ë©´ ì•„ë¬´ê²ƒë„ í•˜ì§€ ì•ŠìŒ (ì¤‘ë³µ í† í° ì†Œëª¨ ë°©ì§€)
+        if (cachedStoryDialogues.ContainsKey(step)) yield break;
+
+        // 2. ë™ì‹œ ë‹¤ë°œì  ì¤‘ë³µ í†µì‹  ë°©ì§€ ë½(Lock)
+        while (isFetching) yield return null;
+        isFetching = true;
+
+        // 3. [ê°œë°œì ëª¨ë“œ] ì¼œì ¸ ìˆìœ¼ë©´ API í†µì‹  ìƒëµ í›„ ê¸°ë³¸ ëŒ€ì‚¬(defaultOutput) ì—°ê²°
+        if (isDevMode)
+        {
+            Debug.Log($"<color=yellow>[ê°œë°œì ëª¨ë“œ]</color> {npcName} - ìŠ¤í… {step} ê¸°ë³¸ ëŒ€ì‚¬ë¡œ ëŒ€ì²´ (API í˜¸ì¶œ 0íšŒ)");
+            // ë¯¸ë¦¬ íŒŒì‹±í•´ ë‘” ë””í´íŠ¸ ëŒ€ì‚¬ í’€ì„ ê·¸ëŒ€ë¡œ ì°¸ì¡°í•˜ì—¬ ìºì‹±í•©ë‹ˆë‹¤.
+            cachedStoryDialogues[step] = defaultDialoguePool;
+            isFetching = false;
+            yield break;
+        }
+        // 4. ì´ NPCì—ê²Œ í•´ë‹¹ ìŠ¤í…ì˜ ìŠ¤í† ë¦¬ ë°ì´í„°ê°€ ì¡´ì¬í•˜ëŠ”ì§€ í™•ì¸
+        StoryContextData targetContext = GetContextForStep(step);
+        if (targetContext == null)
+        {
+            // ìŠ¤í…ì— ë§ëŠ” ë°ì´í„°ê°€ ì—†ë‹¤ë©´ í†µì‹ í•˜ì§€ ì•ŠìŒ (ìì—°ìŠ¤ëŸ½ê²Œ defaultOutputìœ¼ë¡œ í´ë°±)
+            isFetching = false;
+            yield break;
+        }
+
+        // 5. ì‹¤ì œ API í†µì‹  ì§„í–‰
+        Debug.Log($"<color=cyan>[API ìš”ì²­]</color> {npcName} - ìŠ¤í… {step} ë°ì´í„° ë¡œë”© ì¤‘...");
+
+        string apiKey = llmSettings.apiKey.Trim();
+        string modelName = llmSettings.modelName.Trim();
+        string url = $"https://generativelanguage.googleapis.com/v1beta/models/{modelName}:generateContent?key={apiKey}";
+
+        JObject requestData = new JObject
+        {
+            ["contents"] = new JArray { new JObject { ["parts"] = new JArray { new JObject { ["text"] = BuildPrompt(targetContext) } } } }
+        };
+
+        using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
+        {
+            byte[] bodyRaw = Encoding.UTF8.GetBytes(requestData.ToString());
+            request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.timeout = 10;
+
+            yield return request.SendWebRequest();
+
+            if (request.result == UnityWebRequest.Result.Success)
+            {
+                try
+                {
+                    JObject responseJson = JObject.Parse(request.downloadHandler.text);
+                    string rawText = responseJson["candidates"][0]["content"]["parts"][0]["text"].ToString();
+                    List<string> parsedDialogue = ProcessDialogueText(rawText);
+
+                    if (parsedDialogue.Count > 0)
+                    {
+                        cachedStoryDialogues[step] = parsedDialogue; // ë”•ì…”ë„ˆë¦¬ì— ì˜êµ¬ ìºì‹±
+                        Debug.Log($"<color=green>[ë¡œë”© ì™„ë£Œ]</color> {npcName} - ìŠ¤í… {step} ìºì‹± ì„±ê³µ.");
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogError($"<color=red>[ì‘ë‹µ íŒŒì‹± ì˜¤ë¥˜]</color> {npcName} ìŠ¤í… {step} - {e.Message}");
+                }
+            }
+            else
+            {
+                Debug.LogWarning($"<color=orange>[í†µì‹  ì‹¤íŒ¨]</color> {npcName} ìŠ¤í… {step} - {request.error}");
+            }
+        }
+
+        isFetching = false;
+    }
+
+    private StoryContextData GetContextForStep(int step)
+    {
+        if (StoryManager.Instance == null) return null;
+        foreach (var ctx in StoryManager.Instance.storyContexts)
+        {
+            if (ctx.npcName == this.npcName && ctx.questStep == step) return ctx;
+        }
+        return null;
+    }
+
+    private string BuildPrompt(StoryContextData context)
+    {
+        return $"{context.basePersona}\n\n" +
+               $"[í˜„ì¬ ìƒí™©]\n{context.currentFact}\n\n" +
+               $"[ì œì•½ ì¡°ê±´]\n{context.negativeConstraints}\n\n" +
+               $"[ì‹œìŠ¤í…œ í•„ìˆ˜ ëª…ë ¹]\n" +
+               $"ë„ˆëŠ” ê²Œì„ ì† NPCë‹¤. 2~3ë¬¸ì¥ìœ¼ë¡œ ë‹µë³€í•˜ë˜, ë¬¸ì¥ ì‚¬ì´ì— ë°˜ë“œì‹œ '|' ê¸°í˜¸ë¥¼ ë„£ì–´ë¼.\n" +
+               $"ì ˆëŒ€ 'ë²„ì „', 'ëŒ€ì‚¬:' ê°™ì€ ë¶€ê°€ ì„¤ëª…ì„ ì ì§€ ë§ê³  ì•„ë˜ ì–‘ì‹ë§Œ ì§€ì¼œë¼.\n" +
+               $"ì–‘ì‹: ë¬¸ì¥1 | ë¬¸ì¥2 | ë¬¸ì¥3";
+    }
+
+    private List<string> ProcessDialogueText(string rawText)
+    {
+        List<string> result = new List<string>();
+        string cleanText = rawText.Replace("\\|", "|").Replace("ï½œ", "|");
+        string[] splitLines = cleanText.Split('|');
+
+        foreach (string line in splitLines)
+        {
+            string trimmed = line.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed)) result.Add(trimmed);
+        }
+        return result;
     }
 
     private void Interact()
     {
         if (localInteractionUI != null) localInteractionUI.SetActive(false);
 
+        if (currentState == NPCState.Idle)
+        {
+            int currentStep = StoryManager.Instance != null ? StoryManager.Instance.currentQuestStep : 0;
+
+            // í˜„ì¬ ìŠ¤í…ì˜ ëŒ€ì‚¬ê°€ ìºì‹±ë˜ì–´ ìˆë‹¤ë©´ ê°€ì ¸ì˜¤ê³ , ì—†ìœ¼ë©´ ë””í´íŠ¸ ëŒ€ì‚¬ ì‚¬ìš©
+            if (cachedStoryDialogues.ContainsKey(currentStep))
+            {
+                activeDialoguePool = cachedStoryDialogues[currentStep];
+            }
+            else
+            {
+                activeDialoguePool = defaultDialoguePool;
+            }
+
+            currentState = NPCState.Story;
+            currentStoryIndex = 0;
+        }
+
         switch (currentState)
         {
-            case NPCState.Idle:
-                string greeting = defaultOutput;
-                if (isLoaded && dialoguePool.Count > 0)
-                {
-                    greeting = dialoguePool[Random.Range(0, dialoguePool.Count)];
-                }
-                DialogueUIManager.Instance.ShowDialogue(npcName, greeting);
-                currentState = NPCState.Greeting;
-                break;
-
-            case NPCState.Greeting:
             case NPCState.Story:
-                if (dialogueData != null && dialogueData.storyDialogues != null && currentStoryIndex < dialogueData.storyDialogues.Length)
+                if (activeDialoguePool != null && currentStoryIndex < activeDialoguePool.Count)
                 {
-                    DialogueUIManager.Instance.ShowDialogue(npcName, dialogueData.storyDialogues[currentStoryIndex]);
+                    DialogueUIManager.Instance.ShowDialogue(npcName, activeDialoguePool[currentStoryIndex]);
                     currentStoryIndex++;
-                    currentState = NPCState.Story;
                 }
                 else
                 {
@@ -129,102 +231,20 @@ public class NPCController : MonoBehaviour
 
     private void ShowFarewell()
     {
-        string farewell = (dialogueData != null && !string.IsNullOrEmpty(dialogueData.farewellMessage)) ? dialogueData.farewellMessage : "´ÙÀ½¿¡ ¶Ç º¸Áö.";
-        DialogueUIManager.Instance.ShowDialogue(npcName, farewell);
+        DialogueUIManager.Instance.HideDialogue();
         currentState = NPCState.Farewell;
-
     }
 
     private void ResetDialogueState()
     {
         currentState = NPCState.Idle;
         currentStoryIndex = 0;
-    }
+        activeDialoguePool = null;
 
-    private IEnumerator PreloadDialogue()
-    {
-        if (llmSettings.apiKeys == null || llmSettings.apiKeys.Length == 0)
+        if (isPlayerInRange && localInteractionUI != null)
         {
-            Debug.LogError($"{npcName}: API Å°°¡ ¼³Á¤µÇÁö ¾Ê¾Ò½À´Ï´Ù. LLMSettings¸¦ È®ÀÎÇÏ¼¼¿ä.");
-            yield break;
+            localInteractionUI.SetActive(true);
         }
-
-        Debug.Log($"{npcName} API Åë½Å ½Ãµµ (»ç¿ë ÁßÀÎ Å° ÀÎµ¦½º: {currentKeyIndex})");
-
-        string apiKey = llmSettings.apiKeys[currentKeyIndex].Trim();
-        string modelName = llmSettings.modelName.Trim();
-        string url = $"https://generativelanguage.googleapis.com/v1beta/models/{modelName}:generateContent?key={apiKey}";
-
-        JObject requestData = new JObject
-        {
-            ["contents"] = new JArray { new JObject { ["parts"] = new JArray { new JObject { ["text"] = systemPrompt } } } }
-        };
-
-        string jsonPayload = requestData.ToString();
-
-        // Åë½Å Á¾·á ½Ã ÀÚµ¿À¸·Î ¸Ş¸ğ¸® ´©¼ö ¹æÁö
-        using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
-        {
-            byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonPayload);
-            request.uploadHandler = new UploadHandlerRaw(bodyRaw);
-            request.uploadHandler.contentType = "application/json";
-            request.downloadHandler = new DownloadHandlerBuffer();
-            request.SetRequestHeader("Content-Type", "application/json");
-
-            // À¯´ÏÆ¼ ³»Àå Å¸ÀÓ¾Æ¿ô ±â´É ¼³Á¤ (10ÃÊ)
-            request.timeout = 10;
-
-            // API ÀÀ´ä ´ë±â
-            yield return request.SendWebRequest();
-
-            // Åë½Å °á°ú°¡ '¼º°ø'ÀÌ ¾Æ´Ñ ¸ğµç °æ¿ì (Å¸ÀÓ¾Æ¿ô, 429 µî)
-            if (request.result != UnityWebRequest.Result.Success)
-            {
-                Debug.LogWarning($"<color=orange>[API ¿¬°á ½ÇÆĞ]</color> {npcName} - »çÀ¯: {request.error}. ´ÙÀ½ Å°·Î ±³Ã¼ÇÏ¿© Àç½ÃµµÇÕ´Ï´Ù.");
-
-                // ´ÙÀ½ Å°·Î ÀÎµ¦½º º¯°æ
-                currentKeyIndex = (currentKeyIndex + 1) % llmSettings.apiKeys.Length;
-
-                // ¼­¹ö °úºÎÇÏ ¹× À¯´ÏÆ¼ ÇÁ¸®Â¡ ¹æÁö¸¦ À§ÇØ 1ÃÊ ´ë±â ÈÄ Àç±Í È£Ãâ
-                yield return new WaitForSeconds(1f);
-                yield return StartCoroutine(PreloadDialogue());
-                yield break; 
-            }
-
-            // ¿©±â±îÁö µµ´ŞÇß´Ù¸é Åë½Å ¼º°ø
-            try
-            {
-                JObject responseJson = JObject.Parse(request.downloadHandler.text);
-                string rawText = responseJson["candidates"][0]["content"]["parts"][0]["text"].ToString();
-
-                string[] splitLines = rawText.Split('|');
-                dialoguePool.Clear();
-
-                foreach (string line in splitLines)
-                {
-                    string cleanLine = line.Trim();
-                    if (!string.IsNullOrWhiteSpace(cleanLine))
-                    {
-                        dialoguePool.Add(cleanLine);
-                    }
-                }
-
-                if (dialoguePool.Count > 0)
-                {
-                    isLoaded = true;
-                    Debug.Log($"<color=green>{npcName}ÀÇ ´ë»ç°¡ ÁØºñ ¿Ï·áµÇ¾ú½À´Ï´Ù. (ÁØºñµÈ ´ë»ç: {dialoguePool.Count}°³)</color>");
-                }
-                else
-                {
-                    Debug.LogWarning($"{npcName}: ÆÄ½ÌÇÒ ¼ö ÀÖ´Â ´ë»ç°¡ ¾ø½À´Ï´Ù. ÇÁ·ÒÇÁÆ®¸¦ È®ÀÎÇÏ¼¼¿ä.");
-                }
-            }
-            catch (System.Exception e)
-            {
-                // µ¥ÀÌÅÍ ÆÄ½Ì ¿¡·¯´Â Å° ±³Ã¼ ¹®Á¦°¡ ¾Æ´Ï¹Ç·Î Àç½ÃµµÇÏÁö ¾Ê°í ¿¡·¯¸¸ Ãâ·Â
-                Debug.LogError($"{npcName}: JSON ÇØ¼® ½ÇÆĞ - {e.Message}");
-            }
-        } // using ºí·ÏÀÌ ³¡³ª¸é request °´Ã¼´Â ¾ÈÀüÇÏ°Ô ÆÄ±«
     }
 
     private void OnTriggerEnter(Collider other)
@@ -234,7 +254,10 @@ public class NPCController : MonoBehaviour
             isPlayerInRange = true;
             playerTransform = other.transform;
 
-            if (localInteractionUI != null) localInteractionUI.SetActive(true);
+            if (currentState == NPCState.Idle && localInteractionUI != null)
+            {
+                localInteractionUI.SetActive(true);
+            }
         }
     }
 
@@ -243,13 +266,9 @@ public class NPCController : MonoBehaviour
         if (other.CompareTag("Player"))
         {
             isPlayerInRange = false;
-
             if (localInteractionUI != null) localInteractionUI.SetActive(false);
-
             DialogueUIManager.Instance.HideDialogue();
-
             ResetDialogueState();
-
             if (lookCoroutine != null) StopCoroutine(lookCoroutine);
             lookCoroutine = StartCoroutine(SmoothTurnToOriginal());
         }
@@ -258,11 +277,9 @@ public class NPCController : MonoBehaviour
     private IEnumerator SmoothTurnToPlayer()
     {
         if (playerTransform == null) yield break;
-
         Vector3 direction = (playerTransform.position - transform.position).normalized;
         direction.y = 0;
         Quaternion targetRotation = Quaternion.LookRotation(direction);
-
         while (Quaternion.Angle(transform.rotation, targetRotation) > 0.1f)
         {
             transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, turnSpeed * Time.deltaTime);
@@ -277,7 +294,6 @@ public class NPCController : MonoBehaviour
             transform.rotation = Quaternion.Slerp(transform.rotation, initialRotation, turnSpeed * Time.deltaTime);
             yield return null;
         }
-
         transform.rotation = initialRotation;
     }
 }
