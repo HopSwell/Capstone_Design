@@ -141,7 +141,8 @@ public class NPCController : MonoBehaviour
             }
             else
             {
-                Debug.LogWarning($"<color=orange>[통신 실패]</color> {npcName} 스텝 {step} - {request.error}");
+                string errorBody = request.downloadHandler != null ? request.downloadHandler.text : "상세 내용 없음";
+                Debug.LogWarning($"<color=orange>[통신 실패]</color> {npcName} 스텝 {step} - {request.error}\n상세 원인: {errorBody}");
             }
         }
 
