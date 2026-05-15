@@ -11,13 +11,15 @@ public class NPCController : MonoBehaviour
     public enum NPCState { Idle, Greeting, Story, Farewell }
 
     [Header("테스트 설정")]
-    [Tooltip("체크 시 API 통신을 생략하고 가짜 텍스트를 출력합니다. (토큰 소모 0)")]
+    [Tooltip("체크 시 API 통신을 생략하고 가짜 텍스트를 출력합니다.")]
     public bool isDevMode = false;
 
     [Header("NPC 설정")]
     public string npcName;
-    [TextArea(3, 5)]
-    public string defaultOutput = "지금은 대화하기 좀 어렵네. | 잠시 뒤에 오게나.";
+
+    [Header("디폴트 대사 설정")]
+    [Tooltip("퀘스트 조건이 맞지 않을 때 출력할 대사들입니다. 배열로 여러 개 등록 가능합니다.")]
+    public string[] defaultOutputs = { "지금은 대화하기 좀 어렵네. | 잠시 뒤에 오게나." };
 
     [Header("참조 모듈")]
     public LLMSettings llmSettings;
@@ -35,7 +37,7 @@ public class NPCController : MonoBehaviour
     private int currentStoryIndex = 0;
 
     // 대사 저장소 (메모리 캐싱)
-    private List<string> defaultDialoguePool = new List<string>();
+    private List<List<string>> defaultDialoguePools = new List<List<string>>();
     private Dictionary<int, List<string>> cachedStoryDialogues = new Dictionary<int, List<string>>();
     private List<string> activeDialoguePool = null;
 
@@ -43,12 +45,23 @@ public class NPCController : MonoBehaviour
     private int lastKnownQuestStep = -1;
     private bool isFetching = false;
 
+    // 랜덤 대사 중복 방지용 변수
+    private int lastDefaultIndex = -1;
+
+    // API 지연 제어용 정적 변수
+    private static float nextAvailableRequestTime = 0f;
+    private const float API_DELAY = 1.5f;
+
     private void Start()
     {
         initialRotation = transform.rotation;
-        defaultDialoguePool = ProcessDialogueText(defaultOutput);
 
-        // 씬 시작 시 현재 퀘스트 스텝에 대해서만 로딩 (Plan B 적용)
+        // 모든 디폴트 대사 미리 파싱
+        foreach (string output in defaultOutputs)
+        {
+            defaultDialoguePools.Add(ProcessDialogueText(output));
+        }
+
         if (StoryManager.Instance != null)
         {
             lastKnownQuestStep = StoryManager.Instance.currentQuestStep;
@@ -58,7 +71,6 @@ public class NPCController : MonoBehaviour
 
     void Update()
     {
-        // Page Up/Down 등으로 퀘스트 스텝이 변경된 것을 감지하면 해당 스텝 대본 추가 로딩
         if (StoryManager.Instance != null && StoryManager.Instance.currentQuestStep != lastKnownQuestStep)
         {
             lastKnownQuestStep = StoryManager.Instance.currentQuestStep;
@@ -71,34 +83,53 @@ public class NPCController : MonoBehaviour
         }
     }
 
+    private string GetSystemInstruction()
+    {
+        return "너는 롤플레잉 게임의 NPC 대사를 런타임에 처리하는 '내러티브 텍스트 엔진'이다.\n\n" +
+               "[시스템 목적]\n" +
+               "퀘스트 진행의 무결성(Integrity)을 보장하기 위해, 기획자가 의도한 핵심 정보를 왜곡 없이 플레이어에게 전달해야 한다.\n\n" +
+               "[출력 규칙]\n" +
+               "1. [지정된 대본]의 문장을 하나도 빠짐없이 순서대로 출력할 것.\n" +
+               "2. [페르소나]의 성격에 맞게 말하되, 게임 시스템과의 충돌을 방지하기 위해 대본에 없는 감정 묘사(*웃음* 등), 행동 지문, 사족은 엄격히 차단할 것.\n" +
+               "3. UI 텍스트 파싱 시스템 규격에 맞춰, 문장 사이에는 무조건 '|' 기호를 넣어 구분할 것.\n" +
+               "4. 양식: 대본문장1 | 대본문장2 | 대본문장3 | 대본문장4";
+    }
+
+    private string BuildUserPrompt(StoryContextData context)
+    {
+        return $"[내 이름]: {npcName}\n" +
+               $"[페르소나]: {context.basePersona}\n" +
+               $"[지정된 대본]:\n{context.currentFact}";
+    }
     private IEnumerator FetchStoryDialogueIfMissing(int step)
     {
-        // 1. 이미 캐싱되어 있다면 아무것도 하지 않음 (중복 토큰 소모 방지)
-        if (cachedStoryDialogues.ContainsKey(step)) yield break;
-
-        // 2. 동시 다발적 중복 통신 방지 락(Lock)
-        while (isFetching) yield return null;
-        isFetching = true;
-
-        // 3. [개발자 모드] 켜져 있으면 API 통신 생략 후 기본 대사(defaultOutput) 연결
         if (isDevMode)
         {
-            Debug.Log($"<color=yellow>[개발자 모드]</color> {npcName} - 스텝 {step} 기본 대사로 대체 (API 호출 0회)");
-            // 미리 파싱해 둔 디폴트 대사 풀을 그대로 참조하여 캐싱합니다.
-            cachedStoryDialogues[step] = defaultDialoguePool;
+            Debug.Log($"<color=yellow>[개발자 모드]</color> {npcName} -  퀘스트 단계 : {step} / 디폴트 랜덤 대사 출력)");
             isFetching = false;
-            yield break;
+            yield break; 
         }
-        // 4. 이 NPC에게 해당 스텝의 스토리 데이터가 존재하는지 확인
+    
+
         StoryContextData targetContext = GetContextForStep(step);
         if (targetContext == null)
         {
-            // 스텝에 맞는 데이터가 없다면 통신하지 않음 (자연스럽게 defaultOutput으로 폴백)
             isFetching = false;
             yield break;
         }
 
-        // 5. 실제 API 통신 진행
+        // 트래픽 스파이크 방지용 순차 대기열
+        if (Time.time < nextAvailableRequestTime)
+        {
+            float waitTime = nextAvailableRequestTime - Time.time;
+            nextAvailableRequestTime += API_DELAY;
+            yield return new WaitForSeconds(waitTime);
+        }
+        else
+        {
+            nextAvailableRequestTime = Time.time + API_DELAY;
+        }
+
         Debug.Log($"<color=cyan>[API 요청]</color> {npcName} - 스텝 {step} 데이터 로딩 중...");
 
         string apiKey = llmSettings.apiKey.Trim();
@@ -107,7 +138,9 @@ public class NPCController : MonoBehaviour
 
         JObject requestData = new JObject
         {
-            ["contents"] = new JArray { new JObject { ["parts"] = new JArray { new JObject { ["text"] = BuildPrompt(targetContext) } } } }
+            ["systemInstruction"] = new JObject { ["parts"] = new JArray { new JObject { ["text"] = GetSystemInstruction() } } },
+            ["contents"] = new JArray { new JObject { ["parts"] = new JArray { new JObject { ["text"] = BuildUserPrompt(targetContext) } } } },
+            ["generationConfig"] = new JObject { ["temperature"] = 0.6 }
         };
 
         using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
@@ -116,7 +149,8 @@ public class NPCController : MonoBehaviour
             request.uploadHandler = new UploadHandlerRaw(bodyRaw);
             request.downloadHandler = new DownloadHandlerBuffer();
             request.SetRequestHeader("Content-Type", "application/json");
-            request.timeout = 10;
+
+            request.timeout = 20;
 
             yield return request.SendWebRequest();
 
@@ -130,23 +164,73 @@ public class NPCController : MonoBehaviour
 
                     if (parsedDialogue.Count > 0)
                     {
-                        cachedStoryDialogues[step] = parsedDialogue; // 딕셔너리에 영구 캐싱
+                        cachedStoryDialogues[step] = parsedDialogue;
                         Debug.Log($"<color=green>[로딩 완료]</color> {npcName} - 스텝 {step} 캐싱 성공.");
                     }
                 }
                 catch (System.Exception e)
                 {
-                    Debug.LogError($"<color=red>[응답 파싱 오류]</color> {npcName} 스텝 {step} - {e.Message}");
+                    Debug.LogError($"<color=red>[응답 파싱 오류]</color> {npcName} - {e.Message}");
                 }
             }
             else
             {
-                string errorBody = request.downloadHandler != null ? request.downloadHandler.text : "상세 내용 없음";
-                Debug.LogWarning($"<color=orange>[통신 실패]</color> {npcName} 스텝 {step} - {request.error}\n상세 원인: {errorBody}");
+                string errorBody = request.downloadHandler != null ? request.downloadHandler.text : "내용 없음";
+                Debug.LogWarning($"<color=orange>[통신 실패]</color> {npcName} - {request.error}\n원인: {errorBody}");
             }
         }
 
         isFetching = false;
+    }
+
+    private void Interact()
+    {
+        if (localInteractionUI != null) localInteractionUI.SetActive(false);
+
+        if (currentState == NPCState.Idle)
+        {
+            int currentStep = StoryManager.Instance != null ? StoryManager.Instance.currentQuestStep : 0;
+
+            if (cachedStoryDialogues.ContainsKey(currentStep))
+            {
+                activeDialoguePool = cachedStoryDialogues[currentStep];
+            }
+            else if (defaultDialoguePools.Count > 0)
+            {
+                // 안티 리피티션 랜덤 선택 로직
+                int randomIndex = lastDefaultIndex;
+                if (defaultDialoguePools.Count > 1)
+                {
+                    while (randomIndex == lastDefaultIndex)
+                    {
+                        randomIndex = UnityEngine.Random.Range(0, defaultDialoguePools.Count);
+                    }
+                }
+                else
+                {
+                    randomIndex = 0;
+                }
+
+                lastDefaultIndex = randomIndex;
+                activeDialoguePool = defaultDialoguePools[randomIndex];
+            }
+
+            currentState = NPCState.Story;
+            currentStoryIndex = 0;
+        }
+
+        if (activeDialoguePool != null && currentStoryIndex < activeDialoguePool.Count)
+        {
+            DialogueUIManager.Instance.ShowDialogue(npcName, activeDialoguePool[currentStoryIndex]);
+            currentStoryIndex++;
+        }
+        else
+        {
+            ShowFarewell();
+        }
+
+        if (lookCoroutine != null) StopCoroutine(lookCoroutine);
+        lookCoroutine = StartCoroutine(SmoothTurnToPlayer());
     }
 
     private StoryContextData GetContextForStep(int step)
@@ -159,23 +243,11 @@ public class NPCController : MonoBehaviour
         return null;
     }
 
-    private string BuildPrompt(StoryContextData context)
-    {
-        return $"{context.basePersona}\n\n" +
-               $"[현재 상황]\n{context.currentFact}\n\n" +
-               $"[제약 조건]\n{context.negativeConstraints}\n\n" +
-               $"[시스템 필수 명령]\n" +
-               $"너는 게임 속 NPC다. 2~3문장으로 답변하되, 문장 사이에 반드시 '|' 기호를 넣어라.\n" +
-               $"절대 '버전', '대사:' 같은 부가 설명을 적지 말고 아래 양식만 지켜라.\n" +
-               $"양식: 문장1 | 문장2 | 문장3";
-    }
-
     private List<string> ProcessDialogueText(string rawText)
     {
         List<string> result = new List<string>();
         string cleanText = rawText.Replace("\\|", "|").Replace("｜", "|");
         string[] splitLines = cleanText.Split('|');
-
         foreach (string line in splitLines)
         {
             string trimmed = line.Trim();
@@ -184,56 +256,11 @@ public class NPCController : MonoBehaviour
         return result;
     }
 
-    private void Interact()
-    {
-        if (localInteractionUI != null) localInteractionUI.SetActive(false);
-
-        if (currentState == NPCState.Idle)
-        {
-            int currentStep = StoryManager.Instance != null ? StoryManager.Instance.currentQuestStep : 0;
-
-            // 현재 스텝의 대사가 캐싱되어 있다면 가져오고, 없으면 디폴트 대사 사용
-            if (cachedStoryDialogues.ContainsKey(currentStep))
-            {
-                activeDialoguePool = cachedStoryDialogues[currentStep];
-            }
-            else
-            {
-                activeDialoguePool = defaultDialoguePool;
-            }
-
-            currentState = NPCState.Story;
-            currentStoryIndex = 0;
-        }
-
-        switch (currentState)
-        {
-            case NPCState.Story:
-                if (activeDialoguePool != null && currentStoryIndex < activeDialoguePool.Count)
-                {
-                    DialogueUIManager.Instance.ShowDialogue(npcName, activeDialoguePool[currentStoryIndex]);
-                    currentStoryIndex++;
-                }
-                else
-                {
-                    ShowFarewell();
-                }
-                break;
-
-            case NPCState.Farewell:
-                DialogueUIManager.Instance.HideDialogue();
-                ResetDialogueState();
-                break;
-        }
-
-        if (lookCoroutine != null) StopCoroutine(lookCoroutine);
-        lookCoroutine = StartCoroutine(SmoothTurnToPlayer());
-    }
-
     private void ShowFarewell()
     {
         DialogueUIManager.Instance.HideDialogue();
-        currentState = NPCState.Farewell;
+
+        ResetDialogueState();
     }
 
     private void ResetDialogueState()
@@ -244,9 +271,20 @@ public class NPCController : MonoBehaviour
 
         if (isPlayerInRange && localInteractionUI != null)
         {
+            StartCoroutine(ReactivateUIAfterDelay(1.5f));
+        }
+    }
+    private IEnumerator ReactivateUIAfterDelay(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+
+        // 1.5초가 지난 후에도 플레이어가 여전히 범위 안에 있고, 대화 중이 아니라면 UI 켜기
+        if (isPlayerInRange && currentState == NPCState.Idle && localInteractionUI != null)
+        {
             localInteractionUI.SetActive(true);
         }
     }
+
 
     private void OnTriggerEnter(Collider other)
     {
@@ -254,11 +292,7 @@ public class NPCController : MonoBehaviour
         {
             isPlayerInRange = true;
             playerTransform = other.transform;
-
-            if (currentState == NPCState.Idle && localInteractionUI != null)
-            {
-                localInteractionUI.SetActive(true);
-            }
+            if (currentState == NPCState.Idle && localInteractionUI != null) localInteractionUI.SetActive(true);
         }
     }
 

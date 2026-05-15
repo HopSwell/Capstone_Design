@@ -19,8 +19,4 @@ public class StoryContextData : ScriptableObject
     [Tooltip("NPC가 대화 중 반드시 유저에게 전달해야 하는 정보")]
     public string currentFact;
 
-    [Header("3. 절대 하면 안 되는 행동 (Negative Constraints)")]
-    [TextArea(3, 5)]
-    [Tooltip("탈옥, 환각 방지용 제약 조건")]
-    public string negativeConstraints = "1. 플레이어에게 임의로 아이템, 금화 등의 보상을 약속하지 마시오.\n2. 내가 알려주지 않은 지명이나 인물을 지어내어 말하지 마시오.\n3. 대답은 3문장 이내로 짧고 간결하게 하시오.";
 }
