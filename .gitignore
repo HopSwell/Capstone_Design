@@ -73,3 +73,23 @@ crashlytics-build.properties
 # Temporary auto-generated Android Assets
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+
+# === [유료 에셋 및 보안 파일] ===
+
+# 1. 배경/환경 에셋 
+/[Aa]ssets/Hivemind/
+/[Aa]ssets/Hivemind.meta
+
+# 2. 캐릭터/NPC 에셋 
+/[Aa]ssets/_Characters/
+/[Aa]ssets/_Characters.meta
+
+# 3.기본 튜토리얼
+/[Aa]ssets/TutorialInfo/
+/[Aa]ssets/TutorialInfo.meta
+
+# 4.  API Key
+/[Aa]ssets/_Settings/MyLlmSettings.asset
+/[Aa]ssets/_Settings/MyLlmSettings.asset.meta
+
+# ----------------------------------------------------
