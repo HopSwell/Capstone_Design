@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json.Linq;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text;
@@ -11,15 +12,16 @@ public class NPCController : MonoBehaviour
     public enum NPCState { Idle, Greeting, Story, Farewell }
 
     [Header("테스트 설정")]
-    [Tooltip("체크 시 API 통신을 생략하고 가짜 텍스트를 출력합니다.")]
     public bool isDevMode = false;
 
     [Header("NPC 설정")]
     public string npcName;
 
     [Header("디폴트 대사 설정")]
-    [Tooltip("퀘스트 조건이 맞지 않을 때 출력할 대사들입니다. 배열로 여러 개 등록 가능합니다.")]
     public string[] defaultOutputs = { "지금은 대화하기 좀 어렵네. | 잠시 뒤에 오게나." };
+
+    [Header("퀘스트 제어")]
+    public bool forceDefaultDialogue = false;
 
     [Header("참조 모듈")]
     public LLMSettings llmSettings;
@@ -29,6 +31,15 @@ public class NPCController : MonoBehaviour
 
     [Header("회전 설정")]
     public float turnSpeed = 4f;
+
+    [Header("LLM Retry")]
+    public int maxRetryCount = 3;
+    public float retryBaseDelay = 1.5f;
+    public bool useFactFallbackWhenLLMFails = true;
+
+    public event Action<NPCController, bool> DialogueCompleted;
+    public bool LastDialogueUsedStoryContext { get; private set; }
+
     private Transform playerTransform;
     private Coroutine lookCoroutine;
     private Quaternion initialRotation;
@@ -36,7 +47,6 @@ public class NPCController : MonoBehaviour
     private NPCState currentState = NPCState.Idle;
     private int currentStoryIndex = 0;
 
-    // 대사 저장소 (메모리 캐싱)
     private List<List<string>> defaultDialoguePools = new List<List<string>>();
     private Dictionary<int, List<string>> cachedStoryDialogues = new Dictionary<int, List<string>>();
     private List<string> activeDialoguePool = null;
@@ -44,23 +54,15 @@ public class NPCController : MonoBehaviour
     private bool isPlayerInRange = false;
     private int lastKnownQuestStep = -1;
     private bool isFetching = false;
-
-    // 랜덤 대사 중복 방지용 변수
     private int lastDefaultIndex = -1;
 
-    // API 지연 제어용 정적 변수
     private static float nextAvailableRequestTime = 0f;
     private const float API_DELAY = 1.5f;
 
-    private void Start()
+    private void Start() // 기본 대사 초기화 및 현재 단계 대본 호출
     {
         initialRotation = transform.rotation;
-
-        // 모든 디폴트 대사 미리 파싱
-        foreach (string output in defaultOutputs)
-        {
-            defaultDialoguePools.Add(ProcessDialogueText(output));
-        }
+        RebuildDefaultDialoguePools();
 
         if (StoryManager.Instance != null)
         {
@@ -69,7 +71,7 @@ public class NPCController : MonoBehaviour
         }
     }
 
-    void Update()
+    private void Update() // 이야기 단계 변경 감지 및 상호작용 키 입력 대기
     {
         if (StoryManager.Instance != null && StoryManager.Instance.currentQuestStep != lastKnownQuestStep)
         {
@@ -78,38 +80,78 @@ public class NPCController : MonoBehaviour
         }
 
         if (isPlayerInRange && Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame)
-        {
             Interact();
-        }
     }
 
-    private string GetSystemInstruction()
+    public void SetForceDefaultDialogue(bool value) // 기본 대사 강제 출력 여부 설정
     {
-        return "너는 롤플레잉 게임의 NPC 대사를 런타임에 처리하는 '내러티브 텍스트 엔진'이다.\n\n" +
-               "[시스템 목적]\n" +
-               "퀘스트 진행의 무결성(Integrity)을 보장하기 위해, 기획자가 의도한 핵심 정보를 왜곡 없이 플레이어에게 전달해야 한다.\n\n" +
-               "[출력 규칙]\n" +
-               "1. [지정된 대본]의 문장을 하나도 빠짐없이 순서대로 출력할 것.\n" +
-               "2. [페르소나]의 성격에 맞게 말하되, 게임 시스템과의 충돌을 방지하기 위해 대본에 없는 감정 묘사(*웃음* 등), 행동 지문, 사족은 엄격히 차단할 것.\n" +
-               "3. UI 텍스트 파싱 시스템 규격에 맞춰, 문장 사이에는 무조건 '|' 기호를 넣어 구분할 것.\n" +
-               "4. 양식: 대본문장1 | 대본문장2 | 대본문장3 | 대본문장4";
+        forceDefaultDialogue = value;
     }
 
-    private string BuildUserPrompt(StoryContextData context)
+    public void RefreshStoryDialogueForCurrentStep() // 현재 이야기 단계에 맞는 대본 갱신
     {
-        return $"[내 이름]: {npcName}\n" +
-               $"[페르소나]: {context.basePersona}\n" +
-               $"[지정된 대본]:\n{context.currentFact}";
+        if (StoryManager.Instance == null) return;
+        StartCoroutine(FetchStoryDialogueIfMissing(StoryManager.Instance.currentQuestStep));
     }
-    private IEnumerator FetchStoryDialogueIfMissing(int step)
+
+    private void RebuildDefaultDialoguePools() // 기본 대사 문자열 분할 및 목록 저장
     {
+        defaultDialoguePools.Clear();
+
+        foreach (string output in defaultOutputs)
+            defaultDialoguePools.Add(ProcessDialogueText(output));
+    }
+
+    private string GetSystemInstruction() // 외부 인공지능용 세계관 및 대사 작성 규칙 지시문 정의
+    {
+        return "너는 다크 판타지 조사 게임의 NPC 대사를 생성하는 한국어 내러티브 엔진이다.\n\n" +
+               "[세계관]\n" +
+               "황혼 마을은 슬픔, 분노, 두려움 같은 감정을 드러내는 것을 금기시한다. " +
+               "주민들은 평온한 얼굴과 절제된 말투를 강요받으며, 감정은 단서와 균열로만 새어 나온다.\n\n" +
+               "[목표]\n" +
+               "NPC의 페르소나와 현재 퀘스트 정보를 바탕으로, 플레이어가 다음 행동을 이해할 수 있는 자연스러운 한국어 대사를 만든다.\n\n" +
+               "[대사 품질 규칙]\n" +
+               "1. 출력은 반드시 한국어 대사만 작성한다.\n" +
+               "2. 문장은 짧고 자연스럽게 쓴다. 한 문장은 35자 안팎으로 유지한다.\n" +
+               "3. 전체 출력은 3~5문장으로 제한한다.\n" +
+               "4. 문장 사이에는 반드시 '|' 기호를 넣는다.\n" +
+               "5. 번역투, 설명문, 문어체 보고서 말투를 쓰지 않는다.\n" +
+               "6. 행동 지문, 괄호 설명, 해설, 선택지, 목록 형식은 쓰지 않는다.\n" +
+               "7. 핵심 정보는 빠뜨리지 않되, NPC의 말투로 자연스럽게 풀어 말한다.\n" +
+               "8. 현재 퀘스트 단계에서 알 수 없는 정보는 절대 말하지 않는다.\n" +
+               "9. 감정 억압 세계관은 직접 설명보다 말끝의 망설임, 회피, 경고로 드러낸다.\n\n" +
+               "10. NPC 대사는 게임 속 실제 대화처럼 자연스러워야 한다.\n" +
+               "11. 주제의식을 설명문처럼 말하지 말고, 인물의 망설임, 회피, 경고, 침묵으로 드러낸다.\n" +
+               "12. 출력 문장은 기존 한국어 RPG 대사처럼 짧고 선명하게 쓴다.\n" +
+               "13. 각 NPC의 예시 톤을 가장 우선으로 따른다.\n" +
+               "[나쁜 예]\n" +
+               "이 마을은 감정을 억압하는 사회 구조를 가지고 있으며 주민들은 심리적으로 고통받고 있습니다.\n\n" +
+               "[좋은 예]\n" +
+               "여기서는... 무서워도 웃어야 해요. | 울면 누가 보는 것 같거든요.";
+    }
+
+    private string BuildUserPrompt(StoryContextData context) // 인물 성격 및 핵심 정보가 포함된 요청 지시문 생성
+    {
+        return $"[NPC 이름]\n{npcName}\n\n" +
+               $"[NPC 페르소나]\n{context.basePersona}\n\n" +
+               $"[현재 장면에서 반드시 포함할 핵심 정보]\n{context.currentFact}\n\n" +
+               "[출력 형식]\n" +
+               "짧은 대사 3~5문장. 문장 사이에는 | 사용.\n" +
+               "예: 문장1 | 문장2 | 문장3";
+    }
+
+    private IEnumerator FetchStoryDialogueIfMissing(int step) // 외부 인공지능 통신을 통한 새로운 대사 생성 및 저장
+    {
+        if (isFetching || cachedStoryDialogues.ContainsKey(step))
+            yield break;
+
+        isFetching = true;
+
         if (isDevMode)
         {
-            Debug.Log($"<color=yellow>[개발자 모드]</color> {npcName} -  퀘스트 단계 : {step} / 디폴트 랜덤 대사 출력)");
             isFetching = false;
-            yield break; 
+            yield break;
         }
-    
 
         StoryContextData targetContext = GetContextForStep(step);
         if (targetContext == null)
@@ -118,7 +160,13 @@ public class NPCController : MonoBehaviour
             yield break;
         }
 
-        // 트래픽 스파이크 방지용 순차 대기열
+        if (llmSettings == null || string.IsNullOrWhiteSpace(llmSettings.apiKey) || string.IsNullOrWhiteSpace(llmSettings.modelName))
+        {
+            Debug.LogWarning($"[LLM 설정 없음] {npcName}");
+            isFetching = false;
+            yield break;
+        }
+
         if (Time.time < nextAvailableRequestTime)
         {
             float waitTime = nextAvailableRequestTime - Time.time;
@@ -130,81 +178,137 @@ public class NPCController : MonoBehaviour
             nextAvailableRequestTime = Time.time + API_DELAY;
         }
 
-        Debug.Log($"<color=cyan>[API 요청]</color> {npcName} - 스텝 {step} 데이터 로딩 중...");
-
         string apiKey = llmSettings.apiKey.Trim();
         string modelName = llmSettings.modelName.Trim();
         string url = $"https://generativelanguage.googleapis.com/v1beta/models/{modelName}:generateContent?key={apiKey}";
 
         JObject requestData = new JObject
         {
-            ["systemInstruction"] = new JObject { ["parts"] = new JArray { new JObject { ["text"] = GetSystemInstruction() } } },
-            ["contents"] = new JArray { new JObject { ["parts"] = new JArray { new JObject { ["text"] = BuildUserPrompt(targetContext) } } } },
+            ["systemInstruction"] = new JObject
+            {
+                ["parts"] = new JArray { new JObject { ["text"] = GetSystemInstruction() } }
+            },
+            ["contents"] = new JArray
+            {
+                new JObject
+                {
+                    ["parts"] = new JArray { new JObject { ["text"] = BuildUserPrompt(targetContext) } }
+                }
+            },
             ["generationConfig"] = new JObject { ["temperature"] = 0.6 }
         };
 
-        using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
+        bool success = false;
+        string lastError = "";
+
+        for (int attempt = 1; attempt <= maxRetryCount; attempt++)
         {
-            byte[] bodyRaw = Encoding.UTF8.GetBytes(requestData.ToString());
-            request.uploadHandler = new UploadHandlerRaw(bodyRaw);
-            request.downloadHandler = new DownloadHandlerBuffer();
-            request.SetRequestHeader("Content-Type", "application/json");
-
-            request.timeout = 20;
-
-            yield return request.SendWebRequest();
-
-            if (request.result == UnityWebRequest.Result.Success)
+            using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
             {
-                try
-                {
-                    JObject responseJson = JObject.Parse(request.downloadHandler.text);
-                    string rawText = responseJson["candidates"][0]["content"]["parts"][0]["text"].ToString();
-                    List<string> parsedDialogue = ProcessDialogueText(rawText);
+                byte[] bodyRaw = Encoding.UTF8.GetBytes(requestData.ToString());
+                request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                request.downloadHandler = new DownloadHandlerBuffer();
+                request.SetRequestHeader("Content-Type", "application/json");
+                request.timeout = 20;
 
-                    if (parsedDialogue.Count > 0)
+                yield return request.SendWebRequest();
+
+                if (request.result == UnityWebRequest.Result.Success)
+                {
+                    try
                     {
-                        cachedStoryDialogues[step] = parsedDialogue;
-                        Debug.Log($"<color=green>[로딩 완료]</color> {npcName} - 스텝 {step} 캐싱 성공.");
+                        JObject responseJson = JObject.Parse(request.downloadHandler.text);
+                        string rawText = responseJson["candidates"]?[0]?["content"]?["parts"]?[0]?["text"]?.ToString();
+                        List<string> parsedDialogue = ProcessDialogueText(rawText ?? "");
+
+                        if (parsedDialogue.Count > 0)
+                        {
+                            cachedStoryDialogues[step] = parsedDialogue;
+                            Debug.Log($"[LLM 로딩 완료] {npcName} / step {step}");
+                            success = true;
+                            break;
+                        }
+
+                        lastError = "응답 텍스트가 비어 있음";
+                    }
+                    catch (Exception e)
+                    {
+                        lastError = e.Message;
+                        Debug.LogWarning($"[응답 파싱 실패] {npcName} / step {step} / {attempt}/{maxRetryCount} - {e.Message}");
                     }
                 }
-                catch (System.Exception e)
+                else
                 {
-                    Debug.LogError($"<color=red>[응답 파싱 오류]</color> {npcName} - {e.Message}");
+                    lastError = request.error;
+                    Debug.LogWarning($"[통신 실패] {npcName} / step {step} / {attempt}/{maxRetryCount} - {request.error}");
                 }
+            }
+
+            if (!success && attempt < maxRetryCount)
+            {
+                float delay = retryBaseDelay * attempt;
+                yield return new WaitForSeconds(delay);
+            }
+        }
+
+        if (!success && useFactFallbackWhenLLMFails)
+        {
+            string fallbackText = ConvertFactToFallbackDialogue(targetContext.currentFact);
+            List<string> fallbackDialogue = ProcessDialogueText(fallbackText);
+
+            if (fallbackDialogue.Count > 0)
+            {
+                cachedStoryDialogues[step] = fallbackDialogue;
+                Debug.LogWarning($"[LLM fallback] {npcName} / step {step} - API 실패로 Current Fact를 사용합니다. 마지막 오류: {lastError}");
             }
             else
             {
-                string errorBody = request.downloadHandler != null ? request.downloadHandler.text : "내용 없음";
-                Debug.LogWarning($"<color=orange>[통신 실패]</color> {npcName} - {request.error}\n원인: {errorBody}");
+                Debug.LogWarning($"[LLM 최종 실패] {npcName} / step {step} - fallback도 비어 있습니다. 마지막 오류: {lastError}");
             }
         }
 
         isFetching = false;
     }
 
-    private void Interact()
+    private string ConvertFactToFallbackDialogue(string fact) // 통신 실패 시 핵심 정보를 대체 대사로 변환
     {
-        if (localInteractionUI != null) localInteractionUI.SetActive(false);
+        if (string.IsNullOrWhiteSpace(fact))
+            return "";
+
+        string clean = fact
+            .Replace("\r\n\r\n", "|")
+            .Replace("\n\n", "|")
+            .Replace("\r\n", " ")
+            .Replace("\n", " ")
+            .Replace("\"", "")
+            .Trim();
+
+        return clean;
+    }
+
+    private void Interact() // 상호작용 시 적절한 대사 목록 선택 및 출력
+    {
+        if (localInteractionUI != null)
+            localInteractionUI.SetActive(false);
 
         if (currentState == NPCState.Idle)
         {
             int currentStep = StoryManager.Instance != null ? StoryManager.Instance.currentQuestStep : 0;
+            LastDialogueUsedStoryContext = false;
 
-            if (cachedStoryDialogues.ContainsKey(currentStep))
+            if (!forceDefaultDialogue && cachedStoryDialogues.ContainsKey(currentStep))
             {
                 activeDialoguePool = cachedStoryDialogues[currentStep];
+                LastDialogueUsedStoryContext = true;
             }
             else if (defaultDialoguePools.Count > 0)
             {
-                // 안티 리피티션 랜덤 선택 로직
                 int randomIndex = lastDefaultIndex;
+
                 if (defaultDialoguePools.Count > 1)
                 {
                     while (randomIndex == lastDefaultIndex)
-                    {
                         randomIndex = UnityEngine.Random.Range(0, defaultDialoguePools.Count);
-                    }
                 }
                 else
                 {
@@ -229,92 +333,113 @@ public class NPCController : MonoBehaviour
             ShowFarewell();
         }
 
-        if (lookCoroutine != null) StopCoroutine(lookCoroutine);
+        if (lookCoroutine != null)
+            StopCoroutine(lookCoroutine);
+
         lookCoroutine = StartCoroutine(SmoothTurnToPlayer());
     }
 
-    private StoryContextData GetContextForStep(int step)
+    private StoryContextData GetContextForStep(int step) // 현재 단계에 맞는 대본 데이터 탐색
     {
         if (StoryManager.Instance == null) return null;
-        foreach (var ctx in StoryManager.Instance.storyContexts)
+
+        foreach (StoryContextData ctx in StoryManager.Instance.storyContexts)
         {
-            if (ctx.npcName == this.npcName && ctx.questStep == step) return ctx;
+            if (ctx != null && ctx.npcName == npcName && ctx.questStep == step)
+                return ctx;
         }
+
         return null;
     }
 
-    private List<string> ProcessDialogueText(string rawText)
+    private List<string> ProcessDialogueText(string rawText) // 구분자를 기준으로 문자열을 분할하여 대사 배열로 변환
     {
         List<string> result = new List<string>();
-        string cleanText = rawText.Replace("\\|", "|").Replace("｜", "|");
+        string cleanText = (rawText ?? "").Replace("\\|", "|").Replace("｜", "|");
         string[] splitLines = cleanText.Split('|');
+
         foreach (string line in splitLines)
         {
             string trimmed = line.Trim();
-            if (!string.IsNullOrWhiteSpace(trimmed)) result.Add(trimmed);
+            if (!string.IsNullOrWhiteSpace(trimmed))
+                result.Add(trimmed);
         }
+
         return result;
     }
 
-    private void ShowFarewell()
+    private void ShowFarewell() // 대화 종료 처리 및 완료 알림 발생
     {
         DialogueUIManager.Instance.HideDialogue();
+
+        bool usedStoryDialogue = LastDialogueUsedStoryContext;
+        DialogueCompleted?.Invoke(this, usedStoryDialogue);
+
+        if (usedStoryDialogue && StoryManager.Instance != null)
+            StoryManager.Instance.NotifyNpcDialogueCompleted(npcName);
 
         ResetDialogueState();
     }
 
-    private void ResetDialogueState()
+    private void ResetDialogueState() // 대화 상태 초기화 및 상호작용 대기
     {
         currentState = NPCState.Idle;
         currentStoryIndex = 0;
         activeDialoguePool = null;
+        LastDialogueUsedStoryContext = false;
 
         if (isPlayerInRange && localInteractionUI != null)
-        {
             StartCoroutine(ReactivateUIAfterDelay(1.5f));
-        }
     }
-    private IEnumerator ReactivateUIAfterDelay(float delay)
+
+    private IEnumerator ReactivateUIAfterDelay(float delay) // 지연 시간 후 상호작용 화면 표시 재활성화
     {
         yield return new WaitForSeconds(delay);
 
-        // 1.5초가 지난 후에도 플레이어가 여전히 범위 안에 있고, 대화 중이 아니라면 UI 켜기
         if (isPlayerInRange && currentState == NPCState.Idle && localInteractionUI != null)
-        {
             localInteractionUI.SetActive(true);
-        }
     }
 
-
-    private void OnTriggerEnter(Collider other)
+    private void OnTriggerEnter(Collider other) // 플레이어 접근 감지 및 상호작용 표시 활성화
     {
         if (other.CompareTag("Player"))
         {
             isPlayerInRange = true;
             playerTransform = other.transform;
-            if (currentState == NPCState.Idle && localInteractionUI != null) localInteractionUI.SetActive(true);
+
+            if (currentState == NPCState.Idle && localInteractionUI != null)
+                localInteractionUI.SetActive(true);
         }
     }
 
-    private void OnTriggerExit(Collider other)
+    private void OnTriggerExit(Collider other) // 플레이어 이탈 감지 및 대화창 숨김, 시선 원상복구
     {
         if (other.CompareTag("Player"))
         {
             isPlayerInRange = false;
-            if (localInteractionUI != null) localInteractionUI.SetActive(false);
+
+            if (localInteractionUI != null)
+                localInteractionUI.SetActive(false);
+
             DialogueUIManager.Instance.HideDialogue();
             ResetDialogueState();
-            if (lookCoroutine != null) StopCoroutine(lookCoroutine);
+
+            if (lookCoroutine != null)
+                StopCoroutine(lookCoroutine);
+
             lookCoroutine = StartCoroutine(SmoothTurnToOriginal());
         }
     }
 
-    private IEnumerator SmoothTurnToPlayer()
+    private IEnumerator SmoothTurnToPlayer() // 플레이어 방향으로 부드럽게 회전
     {
         if (playerTransform == null) yield break;
+
         Vector3 direction = (playerTransform.position - transform.position).normalized;
         direction.y = 0;
+
         Quaternion targetRotation = Quaternion.LookRotation(direction);
+
         while (Quaternion.Angle(transform.rotation, targetRotation) > 0.1f)
         {
             transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, turnSpeed * Time.deltaTime);
@@ -322,13 +447,14 @@ public class NPCController : MonoBehaviour
         }
     }
 
-    private IEnumerator SmoothTurnToOriginal()
+    private IEnumerator SmoothTurnToOriginal() // 원래 방향으로 부드럽게 회전 복구
     {
         while (Quaternion.Angle(transform.rotation, initialRotation) > 0.1f)
         {
             transform.rotation = Quaternion.Slerp(transform.rotation, initialRotation, turnSpeed * Time.deltaTime);
             yield return null;
         }
+
         transform.rotation = initialRotation;
     }
 }

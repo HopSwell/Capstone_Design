@@ -12,12 +12,11 @@ public class PlayerMovement : MonoBehaviour
 
     void Update()
     {
-        // [추가] 대화 중이면 움직임 처리 아예 중단!
+        // 대화 중이면 캐릭터 정지
         if (DialogueUIManager.Instance != null && DialogueUIManager.Instance.isDialogueActive) return;
 
         if (Keyboard.current == null || cameraTransform == null) return;
 
-        // ... (아래 이동 로직은 기존과 완전히 동일) ...
         float moveX = 0f;
         float moveZ = 0f;
 

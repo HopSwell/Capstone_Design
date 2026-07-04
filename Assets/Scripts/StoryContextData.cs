@@ -3,7 +3,7 @@ using UnityEngine;
 [CreateAssetMenu(fileName = "NewStoryContext", menuName = "Story/Story Context Data", order = 0)]
 public class StoryContextData : ScriptableObject
 {
-    public string npcName; // 이 대본을 사용할 NPC의 이름
+    public string npcName;
 
     [Header("진행 상태")]
     [Tooltip("이 대본이 사용될 퀘스트의 단계 (예: 0 = 시작 전, 1 = 촌장 만남 이후)")]

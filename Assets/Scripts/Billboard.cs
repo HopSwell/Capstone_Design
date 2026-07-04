@@ -4,15 +4,13 @@ public class Billboard : MonoBehaviour
 {
     private Transform camTransform;
 
-    void Start()
+    void Start() // 메인 카메라 위치 저장
     {
-        // 메인 카메라의 위치를 찾습니다.
         camTransform = Camera.main.transform;
     }
 
-    void LateUpdate()
+    void LateUpdate() // 화면 표시가 항상 카메라를 정면으로 바라보도록 회전
     {
-        // UI가 항상 카메라를 정면으로 바라보게 회전시킵니다.
         transform.LookAt(transform.position + camTransform.forward);
     }
 }

@@ -7,6 +7,6 @@ public class LLMSettings : ScriptableObject
     [Tooltip("API 키를 등록하세요.")]
     public string apiKey;
 
-    [Tooltip("사용할 모델의 이름을 입력하세요. (예: gemini-1.5-flash)")]
-    public string modelName = "gemini-1.5-flash";
+    [Tooltip("사용할 모델의 이름을 입력하세요.")]
+    public string modelName = "gemini-2.5-flash-lite";
 }

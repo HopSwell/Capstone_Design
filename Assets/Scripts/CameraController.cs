@@ -13,19 +13,17 @@ public class CameraController : MonoBehaviour
 
     void Start()
     {
-        // 커서 설정은 이제 UIManager가 관리하지만, 시작 시 1번은 해줍니다.
         Cursor.lockState = CursorLockMode.Locked;
         Cursor.visible = false;
     }
 
     void LateUpdate()
     {
-        // [추가] 대화 중이면 카메라 회전 중단! (대화에 집중)
+        // 대화 중이면 카메라 회전 중단
         if (DialogueUIManager.Instance != null && DialogueUIManager.Instance.isDialogueActive) return;
 
         if (target == null || Mouse.current == null) return;
 
-        // ... (아래 카메라 로직은 기존과 완전히 동일) ...
         Vector2 mouseDelta = Mouse.current.delta.ReadValue();
 
         currentX += mouseDelta.x * mouseSensitivity;
